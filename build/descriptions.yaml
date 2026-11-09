@@ -1,0 +1,7 @@
+# Hand-written descriptions that replace the automatic short version.
+# Use one when a skill's upstream description is over 1024 characters and the
+# automatic cut reads badly. Keep each under 1024 characters, no <angle> tags.
+#
+# link-qc-4-publish-test-cases-azure: >
+#   Publish human-APPROVED test cases to Azure DevOps ... Trigger on "publish TCs to Azure DevOps".
+{}

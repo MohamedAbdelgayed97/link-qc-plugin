@@ -1,0 +1,9 @@
+{
+  "name": "link-qc",
+  "version": "1.3.0",
+  "description": "Link Development QA pipeline: requirements review, manual test case design and live validation, Azure DevOps publishing and sync, Playwright automation, visual UI audits, white-box analysis and retesting.",
+  "author": {
+    "name": "Mohamed Abdelgayed",
+    "email": "Mohamed.Abdelgayed@linkdev.com"
+  }
+}

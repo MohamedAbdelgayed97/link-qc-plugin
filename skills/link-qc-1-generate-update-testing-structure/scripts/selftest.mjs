@@ -1,0 +1,455 @@
+#!/usr/bin/env node
+// Self-test for skill 1's read-only scanners and the .mcp.json migration. No network, no registry, no writes
+// outside a temporary folder. EXITS NON-ZERO ON MISMATCH BY DESIGN (harness, not a reporting script).
+//
+//   node .claude/skills/link-qc-1-generate-update-testing-structure/scripts/selftest.mjs [--pretty]
+//
+// Guards, in order:
+//   1-2  applyMcpMigration() never changes the `azure-devops` entry — cloud or self-hosted — nor any other
+//        non-docx / non-word server (byte-identical before and after), while it removes legacy `word` and
+//        adds / re-pins `docx`.
+//   3    planMcpMigration() never plans an action that names `azure-devops`.
+//   4    detectAdoHosting(): cloud (dev.azure.com https / org@ / ssh / *.visualstudio.com), self-hosted (_git,
+//        _workitems, /tfs/, port, bare org URL), not-ADO (GitHub, GitLab, ssh github, empty, garbage).
+//   5    scanMcp(): package + PAT variable extraction for both entries; a literal token in AZURE_DEVOPS_PAT or
+//        PERSONAL_ACCESS_TOKEN is an inline secret; `${VAR}` references are clean.
+//   6    scanPat(): the referenced variable is the one checked; both names when there is no entry;
+//        `sessionMissing` when the variable is persisted but absent from this process.
+//   7    The template ships both entries with placeholders only, the self-hosted block has the four env keys, and the
+//        optional attachments block runs the launcher with placeholders and no PAT / TOKEN key.
+//   8    planReplace(): only OUR folders (SKILLS + SKILL_RENAMES) can be replaced / removed; every other skill folder
+//        is kept; a wanted folder missing in the source is refused (never deleted); --only narrows the set.
+//   9    scanMcp().adoAttachments / inspectAdoAttachmentsEntry(): present / launcher referenced / launcher on disk /
+//        package pin / sha-current vs stale / literal token; absent on cloud.mcp.json and self-hosted.mcp.json; the
+//        optional server is never in `missing`; a root without .mcp.json still carries the shape.
+//   10   applyMcpMigration() leaves the `azure-devops-attachments` entry byte-identical (with azure-devops) and
+//        planMcpMigration() never names it.
+//   11   The launcher asset parses (node --check), pins ADO_ATTACHMENTS_PACKAGE_PIN, names both PAT variables, requires
+//        node: builtins only, carries no real org / host and no token-looking literal.
+//   12   validate-setup.mjs row `Azure DevOps attachments MCP`: present + launcher → NOT_RUN "configured"; cloud entry
+//        without it → WARN "not configured"; present but launcher missing → WARN "missing"; self-hosted → PASS "not needed".
+//   13   Skill versions: skillVersion() reads only `metadata.version` (semver, quotes stripped), compareSemver(),
+//        versionStatus() matrix, scanSuite().versions, and validate-setup's QA Skills / Skills current rows (a version
+//        behind the source → WARN; a sync report without versions[] reads as before).
+//   14   sync-qa-skills arguments and summary: argValues() keeps every repeated --only (and a comma list) where
+//        parseArgs keeps only the last; syncSummary() keys every status with underscores (missing_in_source, never
+//        missing_in-source); the sync script derives `only` and `summary` through them.
+//   15   Execution limits (skills 5 / 9): scanExecutionLimits() — the coordination directory (QA_CAPACITY_DIR absolute, else
+//        ~/.link-ai-pro/capacity; writable through its nearest parent), the ceiling from config.json only (no file → 2,
+//        invalid → 1), QA_MAX_WORKERS / manifest execution.maxWorkers only lower, QA_LEDGER=off = exclusive execution, a torn
+//        ledger.json; validate-setup's Execution limits / Coordination directory rows; the constants agree with skill 5.
+//   16   Automation type definitions (skill 5): scanAutomationTypes() + the validate-setup row `Automation types`.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { parseArgs, print, run, planMcpMigration, applyMcpMigration, detectAdoHosting, scanMcp, scanPat, inspectAdoEntry, inspectAdoAttachmentsEntry, scanAdoAttachments, adoAttachmentsLauncherAssetPath, ADO_SERVER, ADO_CLOUD_PACKAGE, ADO_SELF_HOSTED_PACKAGE, PAT_VAR_CLOUD, PAT_VAR_SELF_HOSTED, PAT_VARS, DOCX_SERVER, DOCX_ARGS, planReplace, SKILLS, ADO_ATTACHMENTS_SERVER, ADO_ATTACHMENTS_LAUNCHER, ADO_ATTACHMENTS_PACKAGE_PIN, skillVersion, compareSemver, versionStatus, scanSuite, argValues, syncSummary, scanExecutionLimits, scanAutomationTypes, CAPACITY_DEFAULT_CEILING, CAPACITY_AUTO_MAX, CAPACITY_FALLBACK_CEILING, CAPACITY_WORKER_DEMAND, CAPACITY_DIR_VAR, CAPACITY_MAX_WORKERS_VAR } from './lib.mjs';
+process.env.LINK_QC_PROJECT_MODE = '1'; // plugin build: self-test scans its fixtures
+
+const args = parseArgs(process.argv.slice(2));
+const here = path.dirname(fileURLToPath(import.meta.url));
+const fixtures = path.join(here, 'fixtures', 'mcp');
+const template = path.join(here, '..', 'assets', 'mcp.template.json');
+const results = [];
+const check = (id, name, ok, detail = null) => results.push({ id, name, status: ok ? 'PASS' : 'FAIL', detail });
+const loadFixture = (f) => JSON.parse(fs.readFileSync(path.join(fixtures, f), 'utf8'));
+const stable = (o) => JSON.stringify(o);
+
+// A scratch root holding one fixture as its .mcp.json — scanMcp reads from disk. `launcher`: null (none), 'asset' (the
+// shipped launcher copied to .claude/mcp-launchers/) or 'stale' (a one-line stub standing in for an outdated copy).
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-skill1-selftest-'));
+function rootWith(fixture, { launcher = null } = {}) {
+  const dir = path.join(tmp, fixture.replace(/\W+/g, '_') + (launcher ? `_${launcher}` : ''));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(path.join(fixtures, fixture), path.join(dir, '.mcp.json'));
+  if (launcher) {
+    const dst = path.join(dir, ADO_ATTACHMENTS_LAUNCHER);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    if (launcher === 'asset') fs.copyFileSync(adoAttachmentsLauncherAssetPath(), dst);
+    else fs.writeFileSync(dst, '// stale stub — not the shipped launcher\n');
+  }
+  return dir;
+}
+
+// ---- 1-2. Migration leaves azure-devops (and every other non-docx / non-word server) byte-identical ----
+for (const [id, fixture, expectDocxAction] of [[1, 'cloud.mcp.json', 'mcp-added'], [2, 'self-hosted.mcp.json', 'mcp-updated']]) {
+  const before = loadFixture(fixture);
+  const untouched = Object.fromEntries(Object.entries(before.mcpServers).filter(([n, s]) => n !== 'word' && !(Array.isArray(s.args) && s.args.includes('docx-mcp-server'))).map(([n, s]) => [n, stable(s)]));
+  const { json, applied } = applyMcpMigration(structuredClone(before), '/fake/uvx', () => false);
+  const same = Object.entries(untouched).every(([n, s]) => stable(json.mcpServers[n]) === s);
+  const wordGone = !('word' in json.mcpServers);
+  const docx = json.mcpServers[DOCX_SERVER];
+  const docxOk = docx && stable(docx.args) === stable(DOCX_ARGS) && docx.command === '/fake/uvx';
+  const actions = applied.map((a) => a.action);
+  check(id, `applyMcpMigration keeps ${fixture.replace('.mcp.json', '')} azure-devops entry byte-identical, removes word, ${expectDocxAction === 'mcp-added' ? 'adds' : 'pins'} docx`,
+    same && wordGone && docxOk && actions.includes('mcp-removed') && actions.includes(expectDocxAction) && !applied.some((a) => a.server === ADO_SERVER),
+    { same, wordGone, docxOk, actions });
+}
+
+// ---- 3. The plan never names azure-devops ----
+{
+  const plans = ['cloud.mcp.json', 'self-hosted.mcp.json', 'self-hosted-inline-pat.mcp.json'].map((f) => planMcpMigration(loadFixture(f)));
+  const ok = plans.every((p) => p.actions.every((a) => !a.includes(ADO_SERVER)) && !p.legacyWord.includes(ADO_SERVER));
+  check(3, 'planMcpMigration never plans an action on azure-devops', ok, plans.map((p) => p.actions));
+}
+
+// ---- 4. Hosting detection ----
+{
+  const cases = [
+    ['https://dev.azure.com/example-org/ExampleProject/_git/repo', { hosting: 'cloud', orgUrl: 'https://dev.azure.com/example-org', organization: 'example-org', project: 'ExampleProject' }],
+    ['https://example-org@dev.azure.com/example-org/ExampleProject/_git/repo', { hosting: 'cloud', orgUrl: 'https://dev.azure.com/example-org', organization: 'example-org', project: 'ExampleProject' }],
+    ['git@ssh.dev.azure.com:v3/example-org/ExampleProject/repo', { hosting: 'cloud', orgUrl: 'https://dev.azure.com/example-org', organization: 'example-org', project: 'ExampleProject' }],
+    ['https://example-org.visualstudio.com/ExampleProject/_git/repo', { hosting: 'cloud', orgUrl: 'https://example-org.visualstudio.com', organization: 'example-org', project: 'ExampleProject' }],
+    ['https://example-org.visualstudio.com/DefaultCollection/ExampleProject/_git/repo', { hosting: 'cloud', organization: 'example-org', project: 'ExampleProject' }],
+    ['https://dev.azure.com/example-org/ExampleProject/_workitems/edit/123', { hosting: 'cloud', orgUrl: 'https://dev.azure.com/example-org', project: 'ExampleProject' }],
+    ['https://dev.azure.com/example-org', { hosting: 'cloud', orgUrl: 'https://dev.azure.com/example-org', project: null }],
+    ['https://devops.example.com/DefaultCollection/ExampleProject/_git/repo', { hosting: 'self-hosted', orgUrl: 'https://devops.example.com/DefaultCollection', collection: 'DefaultCollection', project: 'ExampleProject' }],
+    ['https://devops.example.com/DefaultCollection/ExampleProject/_workitems/edit/123', { hosting: 'self-hosted', orgUrl: 'https://devops.example.com/DefaultCollection', project: 'ExampleProject' }],
+    ['https://devops.example.com:8080/tfs/DefaultCollection/ExampleProject/_git/repo', { hosting: 'self-hosted', orgUrl: 'https://devops.example.com:8080/tfs/DefaultCollection', collection: 'DefaultCollection', project: 'ExampleProject' }],
+    ['https://devops.example.com/DefaultCollection', { hosting: 'self-hosted', orgUrl: 'https://devops.example.com/DefaultCollection', project: null }],
+    ['https://devops.example.com/tfs/DefaultCollection', { hosting: 'self-hosted', orgUrl: 'https://devops.example.com/tfs/DefaultCollection', collection: 'DefaultCollection' }],
+    ['https://github.com/someone/repo.git', { hosting: null, orgUrl: null }],
+    ['git@github.com:someone/repo.git', { hosting: null }],
+    ['https://gitlab.com/group/sub/repo.git', { hosting: null }],
+    ['', { hosting: null }],
+    [null, { hosting: null }],
+    ['not a url', { hosting: null }],
+  ];
+  const failures = [];
+  for (const [url, expect] of cases) {
+    const got = detectAdoHosting(url);
+    for (const [k, v] of Object.entries(expect)) if (got[k] !== v) failures.push({ url, key: k, expected: v, got: got[k] });
+  }
+  check(4, `detectAdoHosting classifies ${cases.length} URLs (cloud / self-hosted / not ADO)`, failures.length === 0, failures.length ? failures : null);
+}
+
+// ---- 5. scanMcp: package, PAT variable, inline secret ----
+{
+  const cloud = scanMcp(rootWith('cloud.mcp.json')).azureDevops;
+  const self = scanMcp(rootWith('self-hosted.mcp.json')).azureDevops;
+  const selfInline = scanMcp(rootWith('self-hosted-inline-pat.mcp.json'));
+  const cloudInline = scanMcp(rootWith('cloud-inline-pat.mcp.json'));
+  const cloudOk = cloud.present && cloud.package === 'cloud' && cloud.hosting === 'cloud' && cloud.patVar === PAT_VAR_CLOUD && cloud.patKey === 'PERSONAL_ACCESS_TOKEN' && !cloud.inlinePat;
+  const selfOk = self.present && self.package === 'self-hosted' && self.hosting === 'self-hosted' && self.patVar === PAT_VAR_SELF_HOSTED && self.patKey === PAT_VAR_SELF_HOSTED && self.orgUrl === 'https://devops.example.com/DefaultCollection' && self.defaultProject === 'ExampleProject' && self.authMethod === 'pat' && !self.inlinePat;
+  const cleanOk = !scanMcp(rootWith('cloud.mcp.json')).inlineSecrets && !scanMcp(rootWith('self-hosted.mcp.json')).inlineSecrets;
+  const selfInlineOk = selfInline.inlineSecrets && selfInline.azureDevops.inlinePat && selfInline.azureDevops.patVar === null;
+  const cloudInlineOk = cloudInline.inlineSecrets && cloudInline.azureDevops.inlinePat;
+  const missingOk = inspectAdoEntry(undefined).present === false && inspectAdoEntry(undefined).patVar === null;
+  check(5, 'scanMcp reads both azure-devops entries (package, PAT variable, org URL) and flags a literal token in AZURE_DEVOPS_PAT / PERSONAL_ACCESS_TOKEN',
+    cloudOk && selfOk && cleanOk && selfInlineOk && cloudInlineOk && missingOk, { cloudOk, selfOk, cleanOk, selfInlineOk, cloudInlineOk, missingOk, cloud, self });
+  // Secret hygiene of the payload itself: no scanner output may carry the literal token from the fixture.
+  const attInline = scanMcp(rootWith('cloud-attachments-inline-pat.mcp.json'));
+  const leaked = JSON.stringify([selfInline, cloudInline, attInline]).includes('notarealtoken') || JSON.stringify([selfInline, cloudInline, attInline]).includes('OjAwMDAw');
+  check('5b', 'scanMcp output never contains the token value', !leaked);
+}
+
+// ---- 6. scanPat follows the referenced variable; session-vs-machine ----
+{
+  const probe = (envSet, persistedSet) => ({ inProcess: (n) => envSet.includes(n), persisted: (n) => ({ persisted: persistedSet.includes(n), scope: 'test' }) });
+  const a = scanPat(PAT_VAR_SELF_HOSTED, probe([], [PAT_VAR_CLOUD]));            // self-hosted entry, only the cloud var exists → not set
+  const b = scanPat(PAT_VAR_SELF_HOSTED, probe([], [PAT_VAR_SELF_HOSTED]));      // saved, not in session
+  const c = scanPat(PAT_VAR_SELF_HOSTED, probe([PAT_VAR_SELF_HOSTED], [PAT_VAR_SELF_HOSTED])); // ready
+  const d = scanPat(null, probe([], [PAT_VAR_SELF_HOSTED]));                     // no entry: both checked, the set one reported
+  const e = scanPat(null, probe([], []));                                        // nothing anywhere
+  const ok = a.name === PAT_VAR_SELF_HOSTED && !a.persisted && !a.inProcess && !a.sessionMissing && stable(a.checked) === stable([PAT_VAR_SELF_HOSTED])
+    && b.persisted && !b.inProcess && b.sessionMissing && typeof b.restartHint === 'string' && /quit/i.test(b.restartHint)
+    && c.persisted && c.inProcess && !c.sessionMissing
+    && d.name === PAT_VAR_SELF_HOSTED && d.persisted && stable(d.checked) === stable(PAT_VARS)
+    && e.name === PAT_VAR_CLOUD && !e.persisted && !e.inProcess && stable(e.checked) === stable(PAT_VARS);
+  check(6, 'scanPat checks the variable the entry references, both names without an entry, and reports sessionMissing', ok, { a, b, c, d, e });
+}
+
+// ---- 7. Template: both entries, placeholders only ----
+{
+  const t = JSON.parse(fs.readFileSync(template, 'utf8'));
+  const cloud = t.mcpServers?.[ADO_SERVER];
+  const self = t._self_hosted_azure_devops_server?.[ADO_SERVER];
+  const cloudOk = cloud && cloud.args.includes(ADO_CLOUD_PACKAGE) && cloud.env.PERSONAL_ACCESS_TOKEN === `\${${PAT_VAR_CLOUD}}`;
+  const selfOk = self && self.args.includes(ADO_SELF_HOSTED_PACKAGE) && self.env.AZURE_DEVOPS_PAT === `\${${PAT_VAR_SELF_HOSTED}}` && self.env.AZURE_DEVOPS_AUTH_METHOD === 'pat' && self.env.AZURE_DEVOPS_ORG_URL === '{ORG_URL}' && self.env.AZURE_DEVOPS_DEFAULT_PROJECT === '{PROJECT_NAME}';
+  const text = fs.readFileSync(template, 'utf8');
+  const noData = !/nupco|linkdev|link-dev|dev\.azure\.com\/[a-z]/i.test(text);
+  const bothInspect = inspectAdoEntry(cloud).package === 'cloud' && inspectAdoEntry(self).package === 'self-hosted' && !inspectAdoEntry(cloud).inlinePat && !inspectAdoEntry(self).inlinePat;
+  const att = t._optional_azure_devops_attachments_server?.[ADO_ATTACHMENTS_SERVER];
+  const attShape = att ? inspectAdoAttachmentsEntry(att) : null;
+  const attOk = att && att.command === 'node' && stable(att.args) === stable([ADO_ATTACHMENTS_LAUNCHER]) && att.env.AZURE_DEVOPS_ORG_URL === 'https://dev.azure.com/{ORG_NAME}' && att.env.AZURE_DEVOPS_AUTH_METHOD === 'pat' && att.env.AZURE_DEVOPS_DEFAULT_PROJECT === '{PROJECT_NAME}'
+    && !Object.keys(att.env).some((k) => /PAT|TOKEN/i.test(k)) && attShape.launcherReferenced && !attShape.inlinePat && !(ADO_ATTACHMENTS_SERVER in (t.mcpServers || {}));
+  check(7, 'mcp.template.json ships the cloud entry, the self-hosted block and the optional attachments block with placeholders only', Boolean(cloudOk && selfOk && noData && bothInspect && attOk), { cloudOk: Boolean(cloudOk), selfOk: Boolean(selfOk), noData, bothInspect, attOk: Boolean(attOk) });
+}
+
+// ---- 8. planReplace: our folders only ----
+{
+  const ours = ['link-qc-1-generate-update-testing-structure', 'link-qc-5-test-run-automation', 'link-qc-6-ui-testing'];
+  const targetDirs = [...ours, 'i-have-adhd', 'qc-ui', 'find-skills', 'my-own-skill'];
+  const sourceDirs = SKILLS.filter((x) => x !== 'link-qc-6-ui-testing');         // source lacks skill 6
+  const a = planReplace({ targetDirs, wanted: SKILLS, sourceDirs });
+  const b = planReplace({ targetDirs, wanted: ['link-qc-5-test-run-automation', 'not-a-skill'], sourceDirs: SKILLS });
+  const touched = [...a.replace, ...a.remove.map((r) => r.folder), ...b.replace, ...b.remove.map((r) => r.folder)];
+  const ok = stable(a.replace) === stable(ours.slice(0, 2))
+    && stable(a.remove.map((r) => r.folder)) === stable(['i-have-adhd'])                // qc-ui's replacement (skill 6) is missing in source
+    && stable(a.keep) === stable(['find-skills', 'my-own-skill'])
+    && stable(a.refused.map((r) => r.folder)) === stable(['link-qc-6-ui-testing'])
+    && a.install.length === SKILLS.length - 3 && !a.install.includes('link-qc-6-ui-testing')
+    && stable(b.replace) === stable(['link-qc-5-test-run-automation']) && b.remove.length === 0 && b.install.length === 0
+    && !touched.some((x) => ['find-skills', 'my-own-skill', 'not-a-skill'].includes(x));
+  check(8, 'planReplace deletes only our skill folders, keeps every other skill, refuses a folder missing in the source, honours --only', ok, { a, b });
+}
+
+// ---- 9. The optional attachments server: entry shape, launcher on disk, freshness, never required ----
+{
+  const a = scanMcp(rootWith('cloud-attachments.mcp.json', { launcher: 'asset' }));
+  const b = scanMcp(rootWith('cloud-attachments.mcp.json'));
+  const c = scanMcp(rootWith('cloud-attachments.mcp.json', { launcher: 'stale' }));
+  const d = [scanMcp(rootWith('cloud.mcp.json')), scanMcp(rootWith('self-hosted.mcp.json'))];
+  const e = scanMcp(rootWith('cloud-attachments-inline-pat.mcp.json'));
+  const noFile = scanMcp(path.join(tmp, 'no-mcp-json'));
+  const aa = a.adoAttachments;
+  const aOk = aa.present && aa.launcherReferenced && aa.launcherExists && aa.package === ADO_ATTACHMENTS_PACKAGE_PIN && aa.pinned === true && aa.launcherCurrent === true && typeof aa.assetSha256 === 'string'
+    && !aa.inlinePat && aa.orgUrl === 'https://dev.azure.com/example-org' && aa.defaultProject === 'ExampleProject' && aa.authMethod === 'pat'
+    && a.optional[ADO_ATTACHMENTS_SERVER] === true && !a.inlineSecrets && !a.missing.includes(ADO_ATTACHMENTS_SERVER) && a.azureDevops.package === 'cloud';
+  const bOk = b.adoAttachments.present && b.adoAttachments.launcherReferenced && !b.adoAttachments.launcherExists && b.adoAttachments.package === null && b.adoAttachments.launcherCurrent === null;
+  const cOk = c.adoAttachments.launcherExists && c.adoAttachments.launcherCurrent === false && c.adoAttachments.package === null && c.adoAttachments.pinned === null;
+  const dOk = d.every((m) => m.adoAttachments.present === false && m.optional[ADO_ATTACHMENTS_SERVER] === false && !m.missing.includes(ADO_ATTACHMENTS_SERVER));
+  const eOk = e.adoAttachments.inlinePat && e.inlineSecrets;
+  const f1 = inspectAdoAttachmentsEntry({ command: 'npx', args: ['-y', ADO_ATTACHMENTS_PACKAGE_PIN] });
+  const f2 = inspectAdoAttachmentsEntry({ command: 'C:\\Program Files\\nodejs\\node.exe', args: ['.\\.claude\\mcp-launchers\\azure-devops-attachments.cjs'] });
+  const fOk = f1.present && !f1.launcherReferenced && f2.present && f2.launcherReferenced && inspectAdoAttachmentsEntry(undefined).present === false;
+  const noFileOk = noFile.exists === false && noFile.adoAttachments && noFile.adoAttachments.present === false && noFile.optional[ADO_ATTACHMENTS_SERVER] === false;
+  check(9, 'scanMcp reads the optional azure-devops-attachments entry (launcher referenced / on disk / pinned / current vs stale / literal token), absent on the plain fixtures, never required',
+    aOk && bOk && cOk && dOk && eOk && fOk && noFileOk, { aOk, bOk, cOk, dOk, eOk, fOk, noFileOk, a: aa, b: b.adoAttachments, c: c.adoAttachments });
+}
+
+// ---- 10. Migration guard for the attachments entry ----
+{
+  const before = loadFixture('cloud-attachments.mcp.json');
+  const keep = { [ADO_SERVER]: stable(before.mcpServers[ADO_SERVER]), [ADO_ATTACHMENTS_SERVER]: stable(before.mcpServers[ADO_ATTACHMENTS_SERVER]) };
+  const { json, applied } = applyMcpMigration(structuredClone(before), '/fake/uvx', () => false);
+  const same = Object.entries(keep).every(([n, s]) => stable(json.mcpServers[n]) === s);
+  const wordGone = !('word' in json.mcpServers);
+  const docx = json.mcpServers[DOCX_SERVER];
+  const docxOk = docx && stable(docx.args) === stable(DOCX_ARGS);
+  const noTouch = !applied.some((x) => [ADO_SERVER, ADO_ATTACHMENTS_SERVER].includes(x.server));
+  const plans = ['cloud-attachments.mcp.json', 'cloud-attachments-inline-pat.mcp.json'].map((f) => planMcpMigration(loadFixture(f)));
+  const planOk = plans.every((p) => p.actions.every((a) => !a.includes(ADO_ATTACHMENTS_SERVER) && !a.includes(ADO_SERVER)) && !p.legacyWord.includes(ADO_ATTACHMENTS_SERVER));
+  check(10, 'applyMcpMigration leaves azure-devops-attachments (and azure-devops) byte-identical, removes word, adds docx; planMcpMigration never names it', same && wordGone && docxOk && noTouch && planOk, { same, wordGone, docxOk: Boolean(docxOk), noTouch, planOk });
+}
+
+// ---- 11. The launcher asset ----
+{
+  const asset = adoAttachmentsLauncherAssetPath();
+  const text = asset ? fs.readFileSync(asset, 'utf8') : '';
+  const parses = asset ? run(`node --check "${asset}"`).ok : false;
+  const ok = Boolean(asset) && parses
+    && text.includes(ADO_ATTACHMENTS_PACKAGE_PIN) && text.includes(PAT_VAR_CLOUD) && text.includes(PAT_VAR_SELF_HOSTED) && text.includes("'use strict'")
+    && !/require\(\s*['"](?!node:)/.test(text)
+    && !/nupco|linkdev|link-dev|dev\.azure\.com\/[a-z]/i.test(text)
+    && !/[A-Za-z0-9+/]{40,}={0,2}/.test(text);
+  check(11, 'launcher asset parses, pins the package, names both PAT variables, requires node: builtins only, carries no data or token-looking literal', ok, { asset, parses });
+}
+
+// ---- 12. validate-setup.mjs row for the optional server ----
+{
+  const validate = path.join(here, 'validate-setup.mjs');
+  const rowFor = (root) => {
+    const r = spawnSync(process.execPath, [validate, '--root', root], { encoding: 'utf8' });
+    try { return JSON.parse(r.stdout).rows.find((x) => x.item === 'Azure DevOps attachments MCP') || null; } catch { return null; }
+  };
+  const present = rowFor(rootWith('cloud-attachments.mcp.json', { launcher: 'asset' }));
+  const absent = rowFor(rootWith('cloud.mcp.json'));
+  const missing = rowFor(rootWith('cloud-attachments.mcp.json'));
+  const stale = rowFor(rootWith('cloud-attachments.mcp.json', { launcher: 'stale' }));
+  const selfHosted = rowFor(rootWith('self-hosted.mcp.json'));
+  const ok = present?.status === 'NOT_RUN' && /configured/.test(present.reason)
+    && absent?.status === 'WARN' && /not configured/.test(absent.reason)
+    && missing?.status === 'WARN' && /missing/.test(missing.reason)
+    && stale?.status === 'WARN' && /outdated/.test(stale.reason)
+    && selfHosted?.status === 'PASS' && /not needed/.test(selfHosted.reason);
+  check(12, 'validate-setup row: present → NOT_RUN configured; cloud without it → WARN; launcher missing / outdated → WARN; self-hosted → PASS not needed', ok, { present, absent, missing, stale, selfHosted });
+}
+
+// ---- 13. Skill versions: metadata.version parser, semver compare, status matrix, scanSuite + validate-setup rows ----
+{
+  const fm = (body) => `---\nname: x\ndescription: y\n${body}---\n\n# x\n`;
+  const parse = {
+    quoted: skillVersion(fm('metadata:\n  version: "1.2.3"\n')) === '1.2.3',
+    unquoted: skillVersion(fm('metadata:\n  tags: a\n  version: 0.10.0\n')) === '0.10.0',
+    single: skillVersion(fm("metadata:\n  version: '2.0.1'\n")) === '2.0.1',
+    crlf: skillVersion(fm('metadata:\r\n  version: "1.0.0"\r\n').replace(/\n/g, '\r\n').replace(/\r\r/g, '\r')) === '1.0.0',
+    missing: skillVersion(fm('model: x\n')) === null,
+    invalid: skillVersion(fm('metadata:\n  version: "1.0"\n')) === null,
+    topLevelIgnored: skillVersion(fm('version: 1.0.0\n')) === null,
+    otherBlockIgnored: skillVersion(fm('other:\n  version: 1.0.0\n')) === null,
+    afterMetadataBlock: skillVersion(fm('metadata:\n  tags: a\nmodel: m\n  version: 9.9.9\n')) === null,
+    noFrontMatter: skillVersion('# just a heading') === null && skillVersion(null) === null,
+  };
+  const cmp = compareSemver('1.2.3', '1.2.3') === 0 && compareSemver('1.2.3', '1.10.0') === -1 && compareSemver('2.0.0', '1.99.99') === 1 && compareSemver('1.0', '1.0.0') === null;
+  const st = (installed, source, installedExists = true) => versionStatus({ installed, source, installedExists });
+  const matrix = st('1.0.0', '1.0.0') === 'current' && st('1.0.0', '1.1.0') === 'update-available' && st('1.2.0', '1.1.0') === 'ahead-of-source'
+    && st(null, '1.0.0') === 'pre-versioning' && st(null, '1.0.0', false) === 'not-installed' && st('1.0.0', null) === 'unversioned' && st(null, null, false) === 'unversioned';
+  // scanSuite reads the installed versions; validate-setup shows them and turns a version behind the source into WARN
+  const root = path.join(tmp, 'suite');
+  for (const s of SKILLS) {
+    fs.mkdirSync(path.join(root, '.claude', 'skills', s), { recursive: true });
+    fs.writeFileSync(path.join(root, '.claude', 'skills', s, 'SKILL.md'), fm(s === SKILLS[0] ? 'metadata:\n  version: "1.0.0"\n' : ''));
+  }
+  const su = scanSuite(root);
+  const suiteOk = su.present.length === SKILLS.length && stable(su.versions) === stable({ [SKILLS[0]]: '1.0.0' });
+  const validate = path.join(here, 'validate-setup.mjs');
+  const report = path.join(tmp, 'sync-report.json');
+  const rows = (sync) => {
+    fs.writeFileSync(report, JSON.stringify(sync));
+    const r = spawnSync(process.execPath, [validate, '--root', root, '--sync-report', report], { encoding: 'utf8' });
+    try { const j = JSON.parse(r.stdout); return { suite: j.rows.find((x) => x.item === 'QA Skills'), current: j.rows.find((x) => x.item === 'Skills current') }; } catch { return {}; }
+  };
+  const base = { source: { ref: 'abc_2026-10-19' }, summary: { current: 10 } };
+  const behind = rows({ ...base, versions: [{ skill: SKILLS[0], installedVersion: '1.0.0', sourceVersion: '1.1.0', versionStatus: 'update-available' }] });
+  const same = rows({ ...base, versions: [{ skill: SKILLS[0], installedVersion: '1.0.0', sourceVersion: '1.0.0', versionStatus: 'current' }] });
+  const legacy = rows(base);
+  const rowsOk = /versions: .*1\.0\.0/.test(behind.suite?.reason || '')
+    && behind.current?.status === 'WARN' && /1\.0\.0 → 1\.1\.0 \(update-available\)/.test(behind.current.reason)
+    && same.current?.status === 'PASS' && /\(current\)/.test(same.current.reason)
+    && legacy.current?.status === 'PASS' && !/versions:/.test(legacy.current.reason);
+  check(13, 'skill versions: metadata.version parsed (quoted / unquoted / CRLF; top-level, other blocks, invalid → null), semver compare, status matrix, scanSuite versions, validate-setup rows (behind → WARN, current → PASS, legacy report unchanged)',
+    Object.values(parse).every(Boolean) && cmp && matrix && suiteOk && rowsOk, { parse, cmp, matrix, suiteOk, behind, same, legacy });
+}
+
+// ---- 14. sync-qa-skills: repeated --only, summary keys ----
+{
+  const A = SKILLS[0], B = SKILLS[4], C = SKILLS[6];
+  const argv = ['--check', '--only', A, '--pretty', '--only', B, '--target', 'x'];
+  const onlyOk = {
+    repeated: stable(argValues(argv, 'only')) === stable([A, B]),
+    parseArgsKeepsLast: parseArgs(argv).only === B, // the reason argValues exists
+    single: stable(argValues(['--apply', '--only', A], 'only')) === stable([A]),
+    comma: stable(argValues(['--only', A + ',' + B, '--only', C], 'only')) === stable([A, B, C]),
+    dedup: stable(argValues(['--only', A, '--only', A], 'only')) === stable([A]),
+    none: stable(argValues(['--check', '--pretty'], 'only')) === '[]',
+    bare: stable(argValues(['--only', '--check'], 'only')) === '[]',
+    otherFlagValue: stable(argValues(['--target', 'only', '--only', A], 'only')) === stable([A]),
+  };
+  const files = ['NEW', 'UPDATED', 'UPDATED', 'CURRENT', 'LOCAL-ONLY', 'SKIPPED', 'MISSING-IN-SOURCE', 'MISSING-IN-SOURCE'].map((status) => ({ status }));
+  const sum = syncSummary(files);
+  const sumOk = stable(sum) === stable({ new: 1, updated: 2, current: 1, local_only: 1, skipped: 1, missing_in_source: 2 }) && !Object.keys(sum).some((k) => k.includes('-'));
+  // the sync script itself must use both (it needs the network to run, so its source is checked)
+  const src = fs.readFileSync(path.join(here, 'sync-qa-skills.mjs'), 'utf8');
+  const wired = /const only = argValues\(process\.argv\.slice\(2\), 'only'\)/.test(src) && /const summary = syncSummary\(files\)/.test(src) && !/args\.only/.test(src);
+  check(14, 'sync arguments and summary: repeated / comma / single --only kept (parseArgs keeps only the last), summary keys use underscores (missing_in_source), sync-qa-skills derives both through lib.mjs',
+    Object.values(onlyOk).every(Boolean) && sumOk && wired, { onlyOk, sum, wired });
+}
+
+// ---- 15. Execution limits (skills 5 / 9): coordination directory, ceiling, lower-only overrides, validate-setup rows ----
+{
+  const xdir = (name) => { const d = path.join(tmp, 'xl-' + name); fs.mkdirSync(d, { recursive: true }); return d; };
+  const home = xdir('home');
+  const proj = xdir('project');
+  // a fixed host (16 GB / 8 cores → Auto 4) and no persisted variable: nothing depends on this machine
+  const HOST = { totalMemMb: 16384, cpus: 8 };
+  const scan = (env = {}, root = proj, persisted = () => ({ persisted: false })) => scanExecutionLimits(root, { env, home, host: HOST, persisted });
+  const capHome = path.join(home, '.link-ai-pro', 'capacity');
+  // the default directory (not created yet — writable through its nearest existing parent), ceiling 2, ledger mode
+  const d0 = scan();
+  const shared = xdir('shared');
+  const viaEnv = scan({ QA_CAPACITY_DIR: shared });
+  const rel = scan({ QA_CAPACITY_DIR: 'relative/dir' });
+  const dirOk = d0.dir === capHome && d0.dirSource === 'home' && d0.dirExists === false && d0.writable === true && d0.ceiling.base === 4 && d0.ceiling.source === 'auto' && d0.ceiling.auto.byMem === 8 && d0.ceiling.auto.byCpu === 4 && d0.ceiling.upper.value === CAPACITY_AUTO_MAX
+    && d0.ledgerMode === 'ledger' && viaEnv.dir === path.resolve(shared) && viaEnv.dirSource === CAPACITY_DIR_VAR && viaEnv.dirExists === true
+    && rel.dir === capHome && rel.warnings.length === 1 && /not an absolute path/.test(rel.warnings[0]);
+  // config.json raises only by hand; overrides only lower; invalid values ignored; an invalid file → 1 (fail safe)
+  fs.writeFileSync(path.join(shared, 'config.json'), JSON.stringify({ machineMaxWorkers: 4 }));
+  fs.mkdirSync(path.join(proj, 'Testing'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'Testing', 'qa-manifest.json'), JSON.stringify({ schemaVersion: 1, execution: { maxWorkers: 3 } }));
+  const cfg = scan({ QA_CAPACITY_DIR: shared, QA_MAX_WORKERS: '6' });
+  const lower = scan({ QA_CAPACITY_DIR: shared, QA_MAX_WORKERS: '1' });
+  const junk = scan({ QA_CAPACITY_DIR: shared, QA_MAX_WORKERS: 'many' });
+  fs.writeFileSync(path.join(shared, 'config.json'), '{ "machineMaxWorkers": 0 }');
+  const bad = scan({ QA_CAPACITY_DIR: shared });
+  const ceilOk = cfg.ceiling.base === 4 && cfg.ceiling.source === 'auto' && cfg.ceiling.upper.from === 'config' && cfg.ceiling.effective === 3 && stable(cfg.ceiling.refusedRaises) === stable([{ by: CAPACITY_MAX_WORKERS_VAR, value: 6 }])
+    && stable(cfg.ceiling.lowered) === stable([{ by: 'manifest execution.maxWorkers', value: 3 }])
+    && lower.ceiling.effective === 1 && lower.ceiling.lowered[0].by === CAPACITY_MAX_WORKERS_VAR
+    && junk.ceiling.invalid.length === 1 && junk.ceiling.effective === 3
+    && bad.config.valid === false && bad.ceiling.base === 1 && bad.ceiling.source === 'config-error';
+  fs.rmSync(path.join(shared, 'config.json'));
+  // QA_LEDGER=off is exclusive execution, never "uncoordinated"; an unreadable ledger.json is reported
+  const off = scan({ QA_CAPACITY_DIR: shared, QA_LEDGER: 'off' });
+  fs.writeFileSync(path.join(shared, 'ledger.json'), '{ torn');
+  const torn = scan({ QA_CAPACITY_DIR: shared });
+  // a QA_LEDGER saved at user level is reported (the probe stands in for the registry / shell profile); unusable host
+  // readings fall back to 2 with the reason
+  const saved = scan({ QA_CAPACITY_DIR: shared }, proj, (n) => ({ persisted: n === 'QA_LEDGER' }));
+  const fb = scanExecutionLimits(proj, { env: { QA_CAPACITY_DIR: shared }, home, host: { totalMemMb: 0, cpus: 0 }, persisted: () => ({ persisted: false }) });
+  const modeOk = off.ledgerMode === 'exclusive' && torn.ledger.exists && torn.ledger.valid === false && saved.ledgerVarPersisted === true && off.ledgerVarPersisted === false
+    && fb.ceiling.base === CAPACITY_FALLBACK_CEILING && fb.ceiling.source === 'auto-fallback';
+  // validate-setup rows (spawned with the env under test; the scanner never writes)
+  const validate = path.join(here, 'validate-setup.mjs');
+  const rowsOf = (env) => {
+    const r = spawnSync(process.execPath, [validate, '--root', proj], { encoding: 'utf8', env: { ...process.env, ...env } });
+    try { const rows = JSON.parse(r.stdout).rows; return { limits: rows.find((x) => x.item === 'Execution limits') || null, dir: rows.find((x) => x.item === 'Coordination directory') || null }; } catch { return { limits: null, dir: null }; }
+  };
+  fs.writeFileSync(path.join(proj, 'Testing', 'qa-manifest.json'), JSON.stringify({ schemaVersion: 1 }));
+  const rTorn = rowsOf({ QA_CAPACITY_DIR: shared, QA_MAX_WORKERS: '' });
+  fs.rmSync(path.join(shared, 'ledger.json'));
+  const rOk = rowsOf({ QA_CAPACITY_DIR: shared, QA_MAX_WORKERS: '', QA_LEDGER: 'off' });
+  const rRaise = rowsOf({ QA_CAPACITY_DIR: shared, QA_MAX_WORKERS: '9' });
+  const before = fs.readdirSync(shared).sort().join(',');
+  // the spawned rows read this machine's host (Auto is host-dependent): only the shape and the statuses are asserted
+  const rowsOk = rTorn.dir?.status === 'FAIL' && /refuse to launch/.test(rTorn.dir.reason)
+    && rOk.dir?.status === 'PASS' && rOk.limits?.status === 'WARN' && /machine ceiling \d+ \(Auto/.test(rOk.limits.reason) && /effective \d+ worker/.test(rOk.limits.reason) && /lowered to \d+ by manifest/.test(rOk.limits.reason) === false && /QA_LEDGER=off in this session/.test(rOk.limits.reason)
+    && rRaise.limits?.status === 'WARN' && /ignored \(only lowers\)/.test(rRaise.limits.reason)
+    && before === '';
+  // the constants agree with skill 5's capacity.mjs when it is installed beside this skill
+  const cap5 = path.join(here, '..', '..', 'link-qc-5-test-run-automation', 'scripts', 'capacity.mjs');
+  let mirror = 'skipped';
+  if (fs.existsSync(cap5)) {
+    const src = fs.readFileSync(cap5, 'utf8');
+    mirror = new RegExp('export const AUTO_MAX = ' + CAPACITY_AUTO_MAX + ';').test(src) && new RegExp('export const AUTO_FALLBACK = ' + CAPACITY_FALLBACK_CEILING + ';').test(src) && CAPACITY_DEFAULT_CEILING === CAPACITY_FALLBACK_CEILING
+      && new RegExp('headed: \\{ memMb: ' + CAPACITY_WORKER_DEMAND.memMb + ', cpu: ' + CAPACITY_WORKER_DEMAND.cpu + ' \\}').test(src)
+      && /path\.join\(os\.homedir\(\), '\.link-ai-pro', 'capacity'\)/.test(src)
+      && /env\.QA_CAPACITY_DIR/.test(src) && /'QA_MAX_WORKERS'/.test(src) && /manifest\.execution \? manifest\.execution\.maxWorkers/.test(src) ? 'agree' : 'differ';
+  }
+  check(15, 'execution limits: default / QA_CAPACITY_DIR / relative ignored; Auto ceiling from the host, config.json only bounds it, overrides only lower, invalid → 1, unusable readings → fallback; QA_LEDGER=off / saved QA_LEDGER reported; validate-setup rows (torn ledger FAIL, raise attempt WARN); constants agree with skill 5',
+    dirOk && ceilOk && modeOk && rowsOk && mirror !== 'differ', { dirOk, ceilOk, modeOk, rowsOk, mirror, rTorn, rOk, rRaise });
+}
+
+// 16 — automation type definitions (skill 5): scanAutomationTypes() finds the automation root (manifest → Testing/Automation
+//      → root), needs @types/node + typescript declared AND installed (hoisted counts), only for a Playwright project;
+//      validate-setup's `Automation types` row: WARN with the install command / PASS / NOT_RUN.
+{
+  const mk = (name, pkg, { manifest = null, installed = [], hoisted = [] } = {}) => {
+    const r = path.join(tmp, 'types-' + name);
+    const auto = path.join(r, manifest || 'Testing/Automation');
+    fs.mkdirSync(auto, { recursive: true });
+    if (manifest) { fs.mkdirSync(path.join(r, 'Testing'), { recursive: true }); fs.writeFileSync(path.join(r, 'Testing', 'qa-manifest.json'), JSON.stringify({ paths: { automationRoot: manifest } })); }
+    if (pkg) fs.writeFileSync(path.join(auto, 'package.json'), JSON.stringify(pkg));
+    for (const [base, list] of [[auto, installed], [r, hoisted]]) for (const p of list) { const d = path.join(base, 'node_modules', ...p.split('/')); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'package.json'), JSON.stringify({ name: p, version: '9.9.9' })); }
+    return r;
+  };
+  const pw = { devDependencies: { '@playwright/test': '^1.50.0' } };
+  const both = { devDependencies: { '@playwright/test': '^1.50.0', '@types/node': '^22', typescript: '^5' } };
+  const sNone = scanAutomationTypes(mk('none', pw));
+  const sDeclared = scanAutomationTypes(mk('declared', both));
+  const sOk = scanAutomationTypes(mk('ok', both, { installed: ['@types/node', 'typescript'] }));
+  const sHoisted = scanAutomationTypes(mk('hoisted', both, { hoisted: ['@types/node', 'typescript'] }));
+  const sManifest = scanAutomationTypes(mk('manifest', pw, { manifest: 'e2e' }));
+  const sNotPw = scanAutomationTypes(mk('notpw', { devDependencies: {} }));
+  const sNoPkg = scanAutomationTypes(mk('nopkg', null));
+  const scanOk = stable(sNone.missing) === stable(['@types/node', 'typescript']) && sNone.installCommand === 'npm install --save-dev @types/node typescript' && sNone.automationRoot === 'Testing/Automation'
+    && stable(sDeclared.missing) === stable(['@types/node', 'typescript'])
+    && sOk.missing.length === 0 && sOk.installed['@types/node'] === '9.9.9' && sOk.installCommand === null
+    && sHoisted.missing.length === 0
+    && sManifest.automationRoot === 'e2e' && sManifest.missing.length === 2
+    && sNotPw.playwrightProject === false && sNotPw.missing.length === 0
+    && sNoPkg.packageJson === false && sNoPkg.missing.length === 0;
+  const rowOf = (r) => { const out = spawnSync(process.execPath, [path.join(here, 'validate-setup.mjs'), '--root', r], { encoding: 'utf8', timeout: 120000 }); try { return (JSON.parse(out.stdout).rows || []).find((x) => x.item === 'Automation types') || null; } catch { return null; } };
+  const rWarn = rowOf(path.join(tmp, 'types-none'));
+  const rPass = rowOf(path.join(tmp, 'types-ok'));
+  const rNa = rowOf(path.join(tmp, 'types-nopkg'));
+  const rowsOk = rWarn?.status === 'WARN' && /npm install --save-dev @types\/node typescript/.test(rWarn.reason) && rPass?.status === 'PASS' && rNa?.status === 'NOT_RUN';
+  check(16, 'automation type definitions: @types/node + typescript declared AND installed (hoisted counts) in the automation root (manifest → Testing/Automation → root), only for a Playwright project; validate-setup row WARN with the install command / PASS / NOT_RUN',
+    scanOk && rowsOk, { sNone, sDeclared, sOk, sHoisted, sManifest, sNotPw, sNoPkg, rWarn, rPass, rNa });
+}
+
+try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+
+const failed = results.filter((r) => r.status !== 'PASS');
+print({ tool: 'selftest-skill1', cases: results.length, passed: results.length - failed.length, failed: failed.length, results, overall: failed.length ? 'FAIL' : 'PASS' }, args);
+process.exit(failed.length ? 1 : 0);

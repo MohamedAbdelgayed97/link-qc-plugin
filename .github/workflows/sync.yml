@@ -1,0 +1,58 @@
+name: Sync skills from Link_AI_Pro
+
+on:
+  schedule:
+    - cron: '23 3 * * *'   # every day at 03:23 UTC (06:23 Cairo)
+  workflow_dispatch:        # "Run workflow" button for a manual sync
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this plugin repo
+        uses: actions/checkout@v4
+
+      - name: Check out the upstream skills
+        uses: actions/checkout@v4
+        with:
+          repository: AhmedZaher1233/Link_AI_Pro
+          path: upstream
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pyyaml
+
+      - name: Rebuild the plugin and apply the fixes
+        id: build
+        run: python build/build.py --upstream upstream --sha "$(git -C upstream rev-parse --short HEAD)"
+
+      - name: Commit the new version
+        if: steps.build.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A .claude-plugin skills build/state.json
+          git commit -m "Sync skills from Link_AI_Pro@$(git -C upstream rev-parse --short HEAD) -> v$VERSION"
+          git push
+
+      - name: Publish the .plugin file as a release (for Cowork upload)
+        if: steps.build.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          python build/build.py --package dist/link-qc.plugin
+          gh release create "v$VERSION" dist/link-qc.plugin \
+            --title "link-qc v$VERSION" \
+            --notes "Skills synced from AhmedZaher1233/Link_AI_Pro@$(git -C upstream rev-parse --short HEAD). Cowork: Customize > Plugins > upload link-qc.plugin. Claude Code updates automatically."

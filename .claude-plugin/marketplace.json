@@ -1,0 +1,11 @@
+{
+  "name": "linkdev-qa",
+  "owner": { "name": "Mohamed Abdelgayed" },
+  "plugins": [
+    {
+      "name": "link-qc",
+      "source": "./",
+      "description": "Link Development QA pipeline skills"
+    }
+  ]
+}

@@ -1,0 +1,149 @@
+# Toolchain — Node.js, NPM, Playwright, type definitions (skill 5), playwright-cli (skills 3c, 5b and 9), Python + Pillow (link-qc-6-ui-testing)
+
+Load only when `validate-setup.mjs` reports `Node.js`, `NPM`, `Playwright`, `Playwright cfg`, `Automation types`,
+`Playwright CLI` or `Python + Pillow` as FAIL/WARN and the mode allows repair (B, C, new
+project). In Mode A the rows are reported as-is with "would be fixed by B".
+
+## Node.js
+* Detected by the scripts (`node --version`). Missing → tell the user Node.js is required and
+  install the LTS version the project specifies — check `.nvmrc`, `.node-version`,
+  `package.json#engines`, README and CI config before choosing. Never install blindly over a
+  pinned version.
+* Verify after installing (`node --version`, `npm --version`).
+
+## NPM / package.json
+* Existing `package.json` → read it, never overwrite; note existing scripts and dependencies.
+* Missing and the automation project needs one → `npm init -y` only then.
+
+## Playwright
+* Detected via `npx --no-install playwright --version` and `@playwright/test` in
+  `package.json`.
+* Missing → install per the project's existing setup (official Playwright TypeScript setup for
+  a new project), then `npx playwright install` for browsers, then verify the version again.
+  Never reinstall a working setup.
+* Installation commands (`npm install`, `npx playwright install`) run under the normal
+  permission flow — they are not pre-approved.
+
+## Type definitions — `@types/node` + `typescript` in the automation project (row `Automation types`)
+* Why: skill 5 copies TypeScript helpers into the automation project (`helpers/*.ts`) that import `node:fs` /
+  `node:crypto` / `node:path` and read `process.env`, and its Checkpoint A runs the project's own `tsc --noEmit`.
+  Without these two devDependencies the editor shows "Cannot find name 'process'" / "Cannot find module 'node:fs'" and
+  Checkpoint A's type check fails or cannot run. `npm init playwright` adds `@types/node` already; older or hand-made
+  projects often lack it.
+* Detected by `scanAutomationTypes()` (preflight `automationTypes`): the automation root from `qa-manifest.json`
+  `paths.automationRoot`, else `Testing/Automation/`, else the project root; each package must be declared in its
+  `package.json` AND present in `node_modules` (searched upward — hoisted workspaces count). Not a Playwright project
+  (no `@playwright/test`) or no `package.json` yet → `NOT_RUN`.
+* Install (Mode B/C/new, row WARN): in the automation root, under the normal permission flow —
+  `npm install --save-dev @types/node typescript` (only the missing ones: the row and `automationTypes.installCommand`
+  name them). Never a global install, never a version pin of your own (npm records the resolved range), never over a
+  project whose `package.json` does not parse. A new project gets them with the Playwright setup in the same step.
+* Verify: run `validate-setup.mjs` again — the row reads PASS with the installed versions. A project that keeps its own
+  `tsconfig.json` with a `types` list must include `"node"` in it (say so when the row is PASS but the user still sees
+  the error in the editor); the row never edits a `tsconfig.json`.
+
+## Database driver — skill 5 3.0, only for TCs with `[DB]` steps (not checked here)
+* Skill 5 detects the project's DB client (`pg`, `mssql`, `mysql2`, `oracledb`, `prisma`, `knex`, `typeorm`,
+  `sequelize`) at intake and, when there is none, asks ONCE to add the matching devDependency; setup never installs
+  one and has no row for it. The connection string lives only in a QC-named environment variable (`QA_DB_URL` /
+  `QA_DB_{NAME}_URL`) — never in `.env`, `.mcp.json` or the learning file.
+
+## playwright-cli — the browser tool of skills 3c, 5b and 9 only (optional)
+
+* What it is: Microsoft's `@playwright/cli` (`playwright-cli`), a command-line browser driver
+  that `link-qc-3c-validate-manual-test-cases-cli`, `link-qc-13-test-run-manual-cli` and `link-qc-9-retesting`
+  (for bugs without an automated TC) use instead of the Playwright MCP server. Skill 3b and every other skill never need it — its absence is a WARN, never a FAIL, and never a reason
+  to hold up anything else.
+* Detected by `playwright-cli --version` (global, what sync installs) or
+  `npx --no-install playwright-cli --version` (a project-local copy); the browser by a chromium
+  build in the Playwright browsers cache (`%LOCALAPPDATA%\ms-playwright`, `~/.cache/ms-playwright`,
+  `PLAYWRIGHT_BROWSERS_PATH`) — a cache check only; the first `open` of 3c or 5b is the real one.
+* Install (Mode B/C/new, only after the user answered **yes** to "install playwright-cli for skills
+  3c, 5b and 9?" — record the answer as a `[type: qa]` line so it is never re-asked): run
+  `sync-qa-skills.mjs --apply --tools` (`skills-sync.md`), or the same steps by hand under the
+  normal permission flow: `npm install -g @playwright/cli@latest`, then
+  `playwright-cli install-browser`, then add the line `.playwright-cli/` to `.gitignore`
+  (playwright-cli writes page snapshots there; they must never be committed). Global on purpose:
+  the tool is a per-machine daemon with a user-level browser cache, and a project without a
+  `package.json` must still be able to run 3c, 5b and 9. Never run `playwright-cli install --skills` — the
+  vendor's own agent skill is not part of this suite; if a project already has it, it shows as
+  LOCAL-ONLY in the sync report and is harmless.
+* Answered **no** → leave the WARN rows as they are and say that 3c and 5b will BLOCK (and skill 9's
+  non-automated bugs stay NOT_RUN) until `/sync-skills --tools` runs; nothing else changes.
+* Optional secrets file for unattended 3c / 5b / 9 logins: the user runs
+  `scripts/set-playwright-secrets.ps1` / `.sh` in their own terminal (`mcp-setup.md` §2b). You
+  only check that the variable and the file exist — never their content.
+
+## Python + Pillow (+ numpy) — link-qc-6-ui-testing's static-image annotation only (optional)
+
+* What it is for: `link-qc-6-ui-testing` draws its red evidence boxes in the page DOM whenever the
+  implementation is a live URL — no Python involved. Pillow (and numpy for colour-mask
+  detection) is needed only to crop and annotate **static images**: an exported design
+  screenshot, or an implementation supplied as screenshots. Its absence is a WARN, never a
+  FAIL, and never holds up anything else.
+* Detected by `scanPython` in `lib.mjs`: `py -3` / `python` / `python3` (Windows first tries the
+  launcher; the Microsoft Store `python` alias exits non-zero and never counts), then
+  `import PIL, numpy`. The row reads `Python + Pillow`.
+* Install (Mode B/C/new, only after the user answered **yes** to the optional-tools question —
+  the same `[type: qa]` answer as playwright-cli): `sync-qa-skills.mjs --apply --tools` runs
+  `<python> -m pip install pillow numpy` **only when an interpreter already exists**. This suite
+  never installs Python itself: when there is none, tell the user once that link-qc-6-ui-testing works on live
+  URLs without it and that installing Python 3 (python.org or `winget install Python.Python.3.12`)
+  and re-running `/sync-skills --tools` enables static-image annotation. Never run `pip` under a
+  project's virtual environment you did not create; if the project has one, say which
+  interpreter was used.
+* Answered **no** → leave the WARN row; link-qc-6-ui-testing reports "annotated crops unavailable for static
+  images" in its Coverage Limitations and embeds the whole image instead.
+
+## Figma MCP — link-qc-6-ui-testing only (optional)
+
+Not a toolchain item: it is an MCP server entry, documented in `mcp-setup.md` §2c. Nothing to
+install — the user logs in once through `/mcp`.
+
+## Azure DevOps attachments MCP — cloud projects only (optional)
+
+Not a toolchain item either: an MCP entry plus the launcher file
+`.claude/mcp-launchers/azure-devops-attachments.cjs`, documented in `mcp-setup.md` §2d. Nothing to
+install — the launcher runs the pinned package through `npx -y` on first start.
+
+## Execution limits — the worker ceiling and the coordination directory of skills 5 and 9
+
+Not an install either: two settings skills 5 and 9 read at every Playwright launch. Rows `Execution limits` and
+`Coordination directory` (`scanExecutionLimits` in `lib.mjs` — read-only). **This skill never writes them and never
+raises a limit**; it reports, and on request shows the user what to write.
+
+* **Coordination directory** — `QA_CAPACITY_DIR` (an absolute path; a relative one is ignored with a warning), else
+  `~/.link-ai-pro/capacity/`. It holds the capacity ledger, the environment leases and the shared rate-limit state;
+  the first skill 5 / 9 run creates it. It must be writable, otherwise skills 5 and 9 refuse to launch Playwright
+  ("no safe coordination") — the row is FAIL and the fix is a writable absolute `QA_CAPACITY_DIR`. A torn
+  `ledger.json` is FAIL too (repair it, or delete it only while no run is active). Several OS users or CI runners on
+  one machine share a ceiling only through ONE `QA_CAPACITY_DIR` that an administrator provisions with read / write
+  access for each of them.
+* **Machine ceiling — Auto** — computed by skill 5's `capacity.mjs` from the host's TOTAL memory / CPU for visible
+  (headed) browsers: min((memory − reserve) ÷ 1536 MB, (cores − reserve) ÷ 1.5) within [1, upper] — the reserve is
+  max(2 GB, 25 %) + 2 cores locally, max(1 GB, 10 %) + 1 core on CI; unusable readings → 2 (WARN with the reason).
+  `upper` = `machineMaxWorkers` in `{coordination directory}/config.json` when the user set one (an absolute bound),
+  else 8 — a safety bound, not the worker count chosen; skill 5's ramp starts at 2 and adapts within it. An invalid
+  file → 1 (fail safe; WARN until fixed). The bound is a **hand edit** by the user (in CI: by whoever provisions the
+  runner) — never by a skill, a flag or an environment variable. Template:
+  `{ "machineMaxWorkers": "auto", "classes": { "compliance": 2, "reviewer": 2 } }`.
+* **Lower-only overrides** — `QA_MAX_WORKERS` (environment), the optional `execution.maxWorkers` in
+  `Testing/qa-manifest.json` (a project limit) and a run's `--workers`. A value above the ceiling is ignored (WARN
+  "ignored (only lowers)"); an invalid one is ignored (WARN).
+* **`QA_LEDGER=off`** — the rollback switch of skill 5's capacity ledger. It never means "uncoordinated": skills 5
+  and 9 then run one Playwright command at a time on the machine, serially (exclusive execution, still under the
+  ceiling) — a reduced protection, so the `Execution limits` row WARNs, also when the variable is SAVED at user level
+  (registry / shell profile) and would affect every later run. Skill 1 never sets or removes it.
+* **Run protections of an existing project** (finite timeouts, active stall protection, the helpers, `retries: 0`,
+  visible local browsers) are reconciled by skill 5 itself before every run (`config-inventory.mjs reconcile`) —
+  skill 1 only checks that the shared config exists.
+* Check live: `node .claude/skills/link-qc-5-test-run-automation/scripts/capacity.mjs config` (the resolved ceiling
+  and the template) and `… capacity.mjs status` (reservations, session holds, leases).
+* Separate from the Claude Code permission allow rules some optimisations would add (B17 of skill 5's optimisation
+  plan): those are pending approval and are not configured here.
+
+## playwright.config.*
+* Create only when required; when it exists, read it and preserve every valid project setting.
+* Requirements are listed in `references/testing-layout.md` (paths from the manifest, HTML
+  reporter, screenshots on failure, trace on retry, no URLs or credentials, base config free of
+  story-specific `headless` / `workers` / reporters).

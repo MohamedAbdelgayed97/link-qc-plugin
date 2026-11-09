@@ -1,0 +1,486 @@
+# Compliance checkpoints — the two mandatory gates
+
+Loaded by `SKILL.md` at **Validating Automation Code** for `<checkpoint_a>` (§3a, before execution)
+and kept for **Re-running Fixed & Impacted Tests** — `<checkpoint_b>` (§4a, on the final code). The two
+procedure blocks are the checkpoints of record; §2-§5 are their reusable checklist, the derived
+procedure and the recording rules. Both gates must reach **PASS for the final delivered scope** before you may claim automation
+compliance. They are separate from execution status: compliant tests can expose application defects,
+and passing tests can still violate these rules.
+
+---
+
+## 1. The three-state model
+
+Every applicable check ends in exactly one state. Record the state, never a bare tick.
+
+| State | Meaning |
+|---|---|
+| `verified-mechanical` | The validator decided it: a rule ran over this file and produced a result. |
+| `verified-semantic` | A reviewer decided it: say what was read (`file:line`) and what the reasoning was. |
+| `unresolved` | The check **applies** and was not completed. Say why. **Never PASS, and never `N/A`.** It holds the gate BLOCKED. |
+| `N/A` | The check **does not apply to this scope at all**, with the reason stated. |
+
+### `N/A` is not a way to close an applicable check
+
+`N/A` means *this rule has nothing to act on here* — there is no Azure DevOps linkage so the
+close-out checks do not apply; no test in scope uses a modifier so the modifier-reason check has
+no subject; the project has no API fixtures so the teardown-for-`api_setup` check has no subject.
+The reason must name **why the rule has no subject**, not why you did not get to it.
+
+**Browser-evidence items in a backend-only scope (3.0).** Items 14, 15, 16a, 19, 46a, 46b and 49 have no subject only when
+no TC and no test in scope is `ui` / `hybrid` — the `no-browser-tests` predicate, decided by `check.mjs` from the
+validator's `counts.layers` AND `tcLayer` over the TC document. A model-written N/A for them is rejected; when either
+side shows a browser test (or a test whose layer is unresolved) they stay applicable, and at B they are never N/A.
+Items 51-54 are N/A only when their own predicate (`api-tests`, `db-tests`, `data-changes`, `api-db-tests`) has no
+subject; 54 is never N/A while any API / DB test is in scope.
+
+It is **never** correct to record `N/A` because:
+
+- the validator could not analyse a file (that is `unresolved` — the check applies, the tool
+  failed: see *When the scanner cannot read valid code* below);
+- a rule landed in the validator's `notRun[]` (those are applicable checks that did not execute —
+  for example an ID rule with no `--tc-ids` list supplied);
+- a `review[]` item was left open;
+- time ran short, the scope was large, or the item looked low-risk.
+
+Each of those is `unresolved`, and **each holds its gate BLOCKED until it is verified.** If you
+are unsure which of the two applies, it is `unresolved`.
+
+**A clean scan is not a clean checkpoint.** `validate-automation.mjs` returns a *scanner* gate. Its
+`review[]` and `notRun[]` arrays are open items that only semantic review can close. A checkpoint is
+`PASS` only when:
+
+1. there are no confirmed violations in scope, **and**
+2. every `review[]` and `notRun[]` item is closed as `verified-mechanical` or `verified-semantic`.
+
+Anything still `unresolved` → the checkpoint is **BLOCKED for those items**, named one by one.
+Continue every piece of work that does not depend on them; do not stop the whole run.
+
+### The result protocol — decided by `scripts/check.mjs gate`, never by hand
+
+Every checkpoint is a **snapshot** (`check.mjs snapshot`: the sha256 of every scoped file, the TC document
+per TC, the requirements, TEST-DATA, the run plan, the readiness table, the validator `exceptions[]`, the
+configs, `timeouts.ts`, the lint config and the tool versions — skill `metadata.version`, every script, the
+validator `RULES`; at B also the evidence manifest, the dispatcher / admission / lease records, gate record
+A and the drafts) and a set of **results**, exactly ONE per (check, unit) for that snapshot:
+`{checkId, unit, snapshotId, status, reason, evidenceRef, executor}`.
+- **Statuses:** `verified-mechanical` · `verified-semantic` · `unresolved` · `N/A` · `scheduled-for-B` ·
+  `FAIL`. **Units:** `scope` (one result for the checkpoint's scope — the semantic default), `phase` (runtime
+  checks), `tool:{tsc|validator|configs|lint|scan}` (mechanical results, written by `check.mjs run`),
+  `file:{path}` (accepted as extra detail).
+- **Rejected — the gate is BLOCKED:** a **missing** applicable result, a **stale** one (another snapshot id),
+  **contradictory** ones (two statuses), a **duplicate** (a second result, even identical — a protocol error,
+  never merged), a runtime result claimed at A (runtime items at A are `scheduled-for-B`), `scheduled-for-B`
+  at B, and N/A without its predicate.
+- **N/A only with a true predicate, recorded with its evidence:** 26 — no `api_setup` in scope · 22 — no
+  `fail` / `slow` modifier · 39 — `exceptions[]` empty · 49 (slot part) — no limited mid-test service.
+  **Never N/A at B:** 16b, 18, 19, 25b, 46b, 48a, 48b — zero events is a PASS with its evidence ("0 stops in 7
+  commands"), not N/A.
+- **Closure:** a mechanical `unresolved` (a `review[]` / `notRun[]` item, a tool that did not run) is closed
+  only by a `verified-semantic` result for the same check; a `FAIL` is never closed — it is repaired, and the
+  repair is a new snapshot.
+- **No edits during a checkpoint:** the gate re-hashes the snapshot; any difference voids it (BLOCKED).
+- **The gate record is a separate file** — `{results_root}/.runs/phase-{N}.checkpoint-{A|B}.json`
+  (`skill5-gate/1`: verdict, snapshot id, every current-snapshot result, rejections, N/A predicates, at B the
+  freshness proof and the frozen draft hashes, tool versions). Drafts never claim a B verdict.
+- **Carried results (incremental Checkpoint B) are SHADOW ONLY** (`check.mjs carry`): it reports which source
+  checks WOULD carry because every dependency hash is unchanged, writes `carry-shadow.json` and nothing else.
+  Checkpoint B keeps the full review until incremental review is separately approved (≥ 5 shadow phases on ≥ 2
+  projects with zero missed findings).
+
+### When the scanner cannot read valid code
+
+A file the scanner cannot strip, or a scope it cannot reach, is a limitation of the scanner — not a
+defect in the code, and never a violation against it. The scanner's own `gate` (`BLOCKED` /
+`NOT_RUN`) is **recorded verbatim and never rewritten**. The checkpoint may still reach `PASS` when
+every affected check is closed another way:
+
+- the project's own tooling — ESLint (with `eslint-plugin-playwright` when present), `tsc`, an
+  existing `npm run lint` — run it first wherever it exists, and record the command and its output;
+- or documented semantic review naming the files covered and the outcome.
+
+Either route must be carried out **against the same `scopeDigest`** the scanner reported. A digest
+mismatch voids it. This route never covers a confirmed violation and never closes an item nobody
+actually checked.
+
+---
+
+### One command per checkpoint — the deterministic steps are the script's, the verdicts are the gate's
+
+`check.mjs checkpoint --checkpoint A|B` (B through `run-data.mjs finalize`) runs, in order and stopping at the first
+failure: (B: a valid, applicable PASS of Checkpoint A covering every final file at its current content; the
+results-freshness check written to the draft run file) → snapshot (the freeze) → the mechanical checks (reused only
+when a COMPLETE earlier run recorded them for this snapshot and the same tools) → (B: the runtime checks) → then either
+`AWAITING_REVIEW` — exit 4, the expected handoff, with `artifacts/checks/{snapshot}/semantic-{A|B}.template.json`
+listing every semantic result still missing, its `status` / `reason` / `evidence` EMPTY — or, with `--review
+{semantic.json}` (a batch naming the frozen snapshot), the validated batch and the gate. It never writes a semantic
+verdict, and a template copied back unfilled is rejected. Exit codes (always, not only `--strict`): PASS 0 · FAIL 1 ·
+BLOCKED 2 · NOT_RUN 3 · AWAITING_REVIEW 4.
+
+**Coordination is bounded and never mistaken for a result.** The compliance processes take their slots in the capacity
+ledger inside ONE `--max-wait` budget per call (default 120 s, capped at 240 s) covering every lock and reservation;
+holders are re-judged on a fresh process table while waiting, and partial reservations are released on any failure. No
+slot within the budget → `BLOCKED` with `coordination { outcome, waitedMs, holders[] }` naming each holder (run id, run
+file, age, alive) — a coordination failure, not a code or test result: nothing is recorded, the same call later records
+afresh. Wait for the holder, or let `capacity.mjs sweep` free an ended one; a forced release is the user's last resort,
+never yours. `--no-ledger` / `QA_LEDGER=off` take the established exclusive reservation, bounded the same way; no safe
+coordination → BLOCKED before any tool starts.
+
+## 2. The reusable checklist
+
+Derived from every rule `SKILL.md` and its references encode, not only from the validator's rule list. For each item:
+`M` = the validator can decide it, `S` = semantic review decides it, `A`/`B` = which checkpoint.
+Items marked `M+S` need both — a clean grep does not prove compliance.
+
+### Page Object Model and layer ownership
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 1 | No raw locator, navigation, evaluate, or keyboard/mouse driving in a spec | M (`pom-*`) + S | A, B |
+| 2 | Nothing chained off an exposed page-object locator — returning a `Locator` must not let a spec bypass the rule | M (`pom-chained-locator`) + S | A, B |
+| 3 | Composite UI flows live in the layer this project actually uses (page object / fixture / its own equivalent) — **not moved into an arbitrary helper just to make a grep clean** | S | A, B |
+| 4 | No spec-local function drives the screen; the one-line delegating fixture alias is allowed | M (`pom-spec-helper`) + S | A, B |
+| 5 | Page objects reused / extended, never duplicated: the `<automation_inventory>` table holds a decision row per screen naming every candidate, and the validator (`--inventory`) reports **no open `pom-duplicate-page`** — a `create` row with an unaddressed candidate, or a pair without a row, **fails this checkpoint**; new files in the Placement Manifest | M (`pom-duplicate-page`) + S | A, B |
+| 6 | Constants have one source of truth; no tolerance/timeout/threshold redeclared in a spec | M (`constant-redeclared`) + S | A, B |
+
+### Assertions and expected behaviour
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 7 | Every test verifies its required outcome — not merely that something rendered | S | A, B |
+| 8 | No placeholder assertion (literal vs literal, empty body, nothing asserted) | M + S | A, B |
+| 9 | Assertions inside approved helpers or page objects are recognised, not rejected | M (`*-call-found`) + S | A, B |
+| 10 | Visibility-only checks used only where visibility or access **is** the requirement | S | A, B |
+| 11 | Expected values trace to an approved requirement or an explicitly approved clarification — never to observed behaviour alone | S | A, B |
+| 12 | Conflicts between an approved TC and its requirement are reported, not silently resolved | S | A, B |
+| 13 | Weak assertions repaired **regardless** of whether aggregate coverage already meets its target | S | A, B |
+
+### Evidence and reporting
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 14 | Every test captures assertion-point evidence — **directly or through a method it calls**. Never report it missing from a direct-call search alone | M + S | A |
+| 15 | Evidence is never captured from `afterEach`/`afterAll`; exactly one per test | M | A |
+| 16a | The call sits at the assertion point and before teardown (code) | S (the scanner cannot prove placement) | A, B |
+| 16b | This phase's heartbeats show each PASS test's `evidence` record BEFORE its `teardown` record — the evidence that test owes under the run's screenshot choice (`delivery.screenshots`: a PASS owes no image under `failed` / `none`; a record is always owed); none owed → PASS "nothing to order" | M (`run-data.mjs verify`) | **B only** |
+| 17 | Evidence helper, screenshot config and output roots exist and are writable | S | A |
+| 18 | The images, the run file (`.runs/phase-N.json`), the report's phase section, the bug file entries and the rendered HTML were **actually produced**, associated with the right TC, and correspond to the final tested code — the images the run's screenshot choice owes (`all`: every executed attempt; `failed`: failing attempts; `none`: none) and the page only under `delivery.report: html` | S | **B only** |
+| 19 | No PASS whose image shows a cleaned-up screen — under `screenshots: failed` / `none` no PASS has an image: PASS with that reason (never N/A) | S | **B only** |
+
+At Checkpoint A only the *implementation and configuration* of evidence and reporting are verified.
+Runtime artifacts do not exist yet: record them as `scheduled for Checkpoint B`, **never PASS**.
+
+### Execution control
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 20 | No focused execution (`only`, `fit`, `describe.only`), including aliased imports | M | A, B |
+| 21 | Every `skip` / `fixme` / `fail` / `slow` — conditional and suite-level — carries a reason traceable to a readiness decision, an approved requirement, or an honoured exception | M + S | A, B |
+| 22 | Expected failures (`fail`) are distinguished from ordinary passes, and extended timeouts (`slow`) from skipped execution, in the report | S | B |
+| 23 | Missing prerequisites stay visible as `SKIP`/`BLOCKED` in the status model — never silently absent | S | A, B |
+| 24 | Waits prefer observable conditions and bounded polling across specs, page objects, fixtures and helpers; justified backoff or an explicit timing requirement is fine; no timeout raised to hide an unexplained failure | M (warning) + S | A, B |
+
+### Isolation, data and errors
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 25a | Each test runs alone; no shared mutable state; the run plan's groups are honoured in the code — a serial group by its `@run:serial-{group}` tag and its own `--workers 1` command, a `mode: 'serial'` describe only around a true chain; an own-data TC in the parallel group only when no parallel TC asserts on a collection its record joins; a TC moved by the isolation check carries its new `@run:` tag and its `run_plan_adjustments[]` entry; side-effecting fixtures / `beforeAll` honour the admission contract (code-craft §6) | M (`admission-contract`) + S | A, B |
+| 25b | Execution honoured the plan: every command ran in its planned mode / workers (after adjustments and recorded lowerings; ONE worker when the scheduler fell back to serial); under dispatch no two conflicting units overlapped and no run-alone / barrier unit overlapped anything (dispatcher timeline vs claims); isolation and burn-in commands ran alone; isolation moves applied | M (`run-data.mjs verify`) | **B only** |
+| 26 | Every `api_setup` precondition has a matching teardown, and teardown runs after the evidence image | S | A, B |
+| 27 | Async operations awaited; no floating promises in specs or page objects | M only when the project's typed lint enables `@typescript-eslint/no-floating-promises` (`check.mjs run --lint`), else S | A, B |
+| 28 | Errors surfaced, never swallowed to obtain a pass | M (`empty-catch`) + S | A, B |
+
+### Traceability and coverage
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 29 | Every test title carries its `[TC-ID]`; every suite title carries its requirement ID | M | A, B |
+| 30 | Referenced IDs validated against the resolved sources; **no requirement ID invented here** — upstream owns ID assignment | M (`trace-unknown-*`) | A, B |
+| 31 | Requirement ID(s) present in the coverage artifacts and in the run JSON | S | A, B |
+| 32 | Requirement → TC → automated test → execution result is mappable end to end | S | B |
+| 33 | Requirement outcome coverage, TC automation coverage and execution pass rate reported **separately** | S | A (first two), B (all three) |
+| 34 | Missing, partial, blocked and unexecuted coverage stay visible | S | A, B |
+
+### Architecture, paths and hygiene
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 35 | Imports resolve; no spec imports another spec | S | A, B |
+| 36 | Files at the paths the Placement Manifest states; spec registered in the project | S | A, B |
+| 37 | Results, logs and screenshots under the resolved roots with the story's `SPEC-*` parent | S | A, B |
+| 38 | No credential, token or connection string in code, config, logs or the learning file | M (warning) + S | A, B |
+| 39 | Every exception honoured by the scanner has had its **source opened and its substance recorded** | S | A, B |
+
+### Code craft, configuration and timeouts (`references/code-craft.md` [M] items)
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 40 | Every generated / updated test wraps each manual step in `step()` (validator run with `--require-steps`); `captureEvidence` is a top-level statement before the Assert step, never inside a step | M (`step-missing`) + S | A, B |
+| 41 | Positional selectors (`first` / `last` / `nth`) are scoped by `filter({ has \| hasText })` or a named container, or justified on the line above | M (`positional-unscoped`) + S | A, B |
+| 42 | No `networkidle` readiness in any layer; every wait bounded by its step deadline — the start-of-test rate-limit reservation outside every step by `rate_limit.max_start_wait`, a `rateLimitSlot()` wait inside a step by `rate_limit.in_step_wait` | M (`wait-network-idle`) + S | A, B |
+| 43 | Every timeout value comes from `timeouts.ts` (none inline — the `rate_limit` keys included); the run protections active — finite action / navigation / test budgets in every project and preset, the stall keys, the helpers, `retries: 0`, visible local browsers, no value above its bound without an `operations` / recorded exception (`config-inventory.mjs reconcile`); initial values and `playwright_version` recorded; calibration changes carry `{key, from, to, reason, evidence}`; no retry added to absorb a timeout | M (`timeout-literal`, `tool:protections`) + S | A (initial), B (calibration) |
+| 44 | ONE shared `playwright.config.ts` to the code-craft §8 contract; extra configs consolidated per `<shared_config>` — deleted only when `config-inventory.mjs` lists them `deletable[]`, unmergeable ones reported; reporters additive | S (+ `config-inventory.mjs`) | A, B |
+| 45 | Created test data named by `uniqueName()` / cleaned by `runPrefix()`; teardown timeouts flagged `cleanup_incomplete` and swept | S | A, B |
+| 46a | Console guard attached in `beforeEach` and reported in `afterEach` (its `report()` first — the `teardown` marker) (code) | M (`console-guard-missing`) + S | A, B |
+| 46b | Console reports produced for every executed test (`console-report` heartbeats); unexpected entries listed under Deviations, never a TC failure by themselves | M (`run-data.mjs verify`) | **B only** |
+| 47 | Page objects, component objects and locator chains follow `code-craft.md` §1-3 (locator order testid → role → label → text → stable CSS, no build-generated attributes); fixtures (when present) wrap `prerequest/` functions (§6); `.gitignore` lines present (§12) | S | A, B |
+| 48a | Stops were taken only on `FROZEN` verdicts from `watchdog.mjs` or as the documented outer-ceiling stop; completed results preserved, interrupted and not-started TCs named; the consumer-project probe recorded PASS or NOT_RUN with the reason — zero stops is a PASS with evidence | M (`run-data.mjs verify`) + S | **B only** |
+| 48b | Every watchdog / stall / admission-wait / timeout event of the phase is classified (`timeout_failure`, environment, …) in the run file — zero events is a PASS with evidence, **never N/A** | M (`run-data.mjs verify`) | **B only** |
+| 49 | The network guard is attached in every spec's `beforeEach` / `afterEach` beside the console guard; every limited mid-test call goes through `rateLimitSlot()` in the page-object method right before the triggering action; no other pacing sleep in any layer | M (`network-guard-missing`) + S | A, B |
+| 50 | No scratch probe in the delivered scope: `scratch.mjs clean` returned `removed` / `absent`, and no scratch output is cited as a TC result, evidence, re-run, burn-in, isolation or freshness proof (`<scratch_investigation>`) | S | A, B |
+
+### API and DB layers (3.0 — `api-db.md`, `code-craft.md` §16-19)
+
+| # | Check | How | Gate |
+|---|---|---|---|
+| 51 | `[API]` lines run through `api/` endpoint clients over the recorded request: every call declares the effect of its mapping row (from a verified contract, never the HTTP method), `maxRedirects: 0`, no raw request, no auth literal; the document layer and the code layer agree | M (`api-*`, `layer-mismatch`, `layer-unresolved`) + S | A, B |
+| 52 | `[DB]` lines run through `db/` query objects over the recorded client: no SQL or driver in a spec, structured writes only, the connection only from the QC variable, the identity verified | M (`db-*`) + S | A, B |
+| 53 | Data changes: every write consented for its TC, on a `test` / `staging` target, on run-owned records only (cascade closure, triggers, row count verified), read back, then torn down or retained — nothing in doubt, nothing refused left unreported | M (`*-unledgered`, `run-data.mjs verify`) + S | A (code), B (ledgers) |
+| 54 | A valid redacted record for every API / DB / hybrid attempt — one per test at its assertion point, schema `skill5-record/1`, matching its TC and attempt, every backend Expected line with a passing assertion in a PASS, no secret | M (`record-*`, `run-data.mjs verify`) + S | A (code), B (records) |
+
+---
+
+## 3. Checkpoint A — before execution
+
+The procedure of record is §3a (`<checkpoint_a>`).
+
+## 3a. Checkpoint A — the procedure of record (`<checkpoint_a>`)
+
+<checkpoint_a>
+**CHECKPOINT A — MANDATORY PRE-RUN COMPLIANCE GATE.** Runs after generation and BEFORE anything
+executes; it is the first gate in `<environment_gate>`. Work the §2 checklist — it is derived from
+every rule in SKILL.md and its references, not only the items repeated below.
+
+**Scope:** every test created, modified or selected for this run, **plus** the page objects,
+fixtures, helpers, configuration and evidence/reporting code they touch.
+
+**Procedure:**
+
+1. **ONE command: snapshot, then the mechanical checks** (§1 *One command per checkpoint*). It freezes the scope and
+   runs the project's own type check, the validator, the config inventory, the run protections and — with `--lint`,
+   where the project has a typed ESLint — the lint, within the compliance limit and the coordination budget, then
+   stops at `AWAITING_REVIEW` with the review template:
+   ```text
+   node <plugin-root>/skills/link-qc-5-test-run-automation/scripts/check.mjs checkpoint --checkpoint A --root . --results-root {results_root} --phase {N} --files {in-scope specs + the page objects, components, fixtures and helpers they touch} --tc {source_tc_doc} --data {TEST-DATA md} --req {REQ files} --run-file {run_file} --inventory {reports_folder}/automation-inventory.md --require-steps [--lint]
+   ```
+   `--files` carries the page objects and helpers too: the wait, positional-selector and
+   `networkidle` rules apply in every layer, and a file the scanner never sees is never checked.
+   `--inventory` is the `<automation_inventory>` decision table: the page-class pass walks the
+   whole automation root on its own, and a candidate pair no row covers is `pom-duplicate-page`
+   (review) that keeps the scanner gate BLOCKED — an unaddressed candidate fails this checkpoint.
+   `--require-steps` is passed for the specs this run generated or updated (legacy specs may
+   omit it; say so). The compact payload gives the validator's `gate`, `counts`, open `review[]` /
+   `notRun[]` / `exceptions[]` (at most 10 named, the rest counted) and the path of the full output under
+   `artifacts/checks/{snapshotId}/` — report them together, never just "clean". A `gate: PASS` means no
+   banned pattern was found and **nothing more**. A type check the project cannot run (no TypeScript in
+   `node_modules`) is `notRun`, never clean. The config inventory must report `verdict: single` (or
+   `multiple` with every extra config listed under `Configurations not merged` with its blocking setting —
+   never an unexplained per-story file); its `timeouts` report names every unlimited action / navigation
+   timeout; and `playwright_version` is recorded with the feature gates it implies (`references/code-craft.md` §14).
+2. **Semantic review** of every judgement the scanner cannot make: correct layer ownership,
+   whether each assertion verifies its required outcome, whether evidence sits at the assertion
+   point, and whether each honoured exception's cited source actually justifies it.
+   **A clean grep does not prove compliance.**
+3. **Fix confirmed automation-code violations immediately.** They are repairs, not
+   recommendations — never defer them, never list them for the user to approve, never ask anyone
+   to say "fix 1". Only an unresolved **business** decision (one that changes what the expected
+   behaviour is) goes to the user.
+4. **Repeat the affected checks after every repair** — a repair invalidates what it touched: run the same
+   `check.mjs checkpoint` command again (a new snapshot id; the old results are stale).
+5. **Proceed with the compliant scope only.** Tests still blocked are isolated and reported
+   against the original scope; the run continues for everything independent of them.
+6. **Fill the review template, then let the gate decide — the same command with `--review`.** Copy
+   `artifacts/checks/{snapshotId}/semantic-A.template.json` to `semantic-A.json` beside it and fill EVERY entry from your
+   review: `verified-semantic` with `file:line` evidence, `unresolved` with why, or `FAIL`; runtime items are recorded
+   `scheduled-for-B` by the gate itself. The file is `{ "snapshot": "{snapshotId}", "results": [{ "check": "{id}", "unit":
+   "scope", "status": "…", "reason": "{what was read and decided}", "evidence": ["{file:line}", …], "executor":
+   "SB-{P|Q|E|D|H}" }, …] }`:
+   ```text
+   node <plugin-root>/skills/link-qc-5-test-run-automation/scripts/check.mjs checkpoint --checkpoint A {the same arguments as step 1} --review {results_root}/artifacts/checks/{snapshotId}/semantic-A.json
+   ```
+   The batch is checked as a whole before anything is written: an invalid entry, a second result for the same check,
+   one that contradicts or repeats a recorded result, another snapshot id or a scope that changed since the snapshot
+   rejects the WHOLE batch (`ok: false`, `errors[]` name each entry) — fix those entries and record the batch again;
+   nothing is ever half-recorded. The same rules as one-by-one recording apply to every entry; the single-result form
+   (`record --check {id} --unit scope --status … --reason … --evidence …`) still works for one late result.
+   The gate writes `.runs/phase-{N}.checkpoint-A.json` (§5) — the record of this gate; copy its verdict,
+   snapshot id and open items into `{run_file}.compliance.checkpoint_a` and the report, never a verdict of
+   your own.
+
+**Gate result.** `PASS` only when there are no confirmed violations in scope **and** every
+`review[]` / `notRun[]` item is closed — by the scanner, by other project tooling, or by
+documented semantic review against the same `scopeDigest`. Anything still unresolved →
+**BLOCKED for those items**, named one by one, while independent work continues.
+
+**At this checkpoint you verify evidence and reporting IMPLEMENTATION AND CONFIGURATION ONLY.**
+The actual images, the completed run file and the report markdown / HTML do not exist yet: record them `scheduled for Checkpoint B`.
+Claiming they exist, or marking their runtime verification passed, is a false claim.
+
+Checklist (all of these, plus every §2 item gated A):
+
+- [ ] Placement Manifest complete; spec + page objects at the stated paths; spec registered (item 36)
+- [ ] Automation inventory written before any page object; validator run with `--inventory` reports
+      no open `pom-duplicate-page` (item 5)
+- [ ] POM: zero inline locators, the `<pom_mandatory>` self-check grep run and reported clean, no
+      spec-local screen driver, nothing chained off a page-object locator (items 1-4)
+- [ ] Every automation-candidate TC implemented or skip-guarded with a precise reason; a `[HUMAN]`
+      candidate implemented up to its first human step and listed `partial (human step: n)`, never
+      full coverage
+- [ ] Every `[E{n}]` / `[A{n}]` / `[D{n}]` resolved through its own ID-keyed entry — no role-to-account,
+      no "first E row", no literal URL or username in code
+- [ ] Coverage table matches the approved document exactly (no invented scenarios); AAA identifiable and
+      ≥ 1 assertion in every test; no banned pattern (`waitForTimeout`, `test.only`, hard-coded
+      credentials or URLs)
+- [ ] Evidence at the assertion point (items 14-16, `<result_organization>`): a direct OR indirect
+      capture is compliant; the validator's `evidence-*` result decides, never a direct-call grep;
+      placement against teardown is always a semantic item
+- [ ] Isolation, the admission contract and the guards (items 25a, 46a, 49); traceability header, REQ-ID in
+      the describe, `[TC-ID]` + polarity tag (+ `@smoke` where marked) in every title
+- [ ] The run protections reconciled (`<shared_config>` step 5b): changes backed up, every conflict reported; the
+      parallel readiness check ran on this scope and its payload is recorded (`<parallel_readiness>`); with
+      `--parallel-shadow` its comparison with the hand plan is recorded too
+- [ ] Open questions resolved (PHASE 2.4): every parked TC generated from a user decision, a
+      learning-file reuse, or a tagged `@unverified-assumption`; every answer already written back to the
+      learning file as a generic rule
+- [ ] Static coverage measured (PHASE 2.5) and the gate verdict recorded before any run
+- [ ] Test-data readiness resolved (PHASE 2.6): every `MISSING` gap searched for a way (learning file,
+      automation helpers, the application's source code, UI journeys, a DB helper) and prepared when one
+      existed; every remaining skip is `data_missing` (no way found), `not creatable` (evidence) or `QC
+      declined`, never a default; every skip guard in the specs traces to one of them
+- [ ] Assertions, expected values, modifiers and waits per items 7, 11, 20-24
+- [ ] Validator result reported in full; every open item closed or the gate BLOCKED for it; every
+      honoured exception's source opened (item 39)
+- [ ] Gate decided by `check.mjs gate --checkpoint A` (`.runs/phase-{N}.checkpoint-A.json`) with the snapshot
+      id and the `scopeDigest`; runtime artifacts `scheduled-for-B`
+</checkpoint_a>
+
+## 4. Checkpoint B — after the re-run
+
+The procedure of record is §4a (`<checkpoint_b>`), including what to do when it finds an automation defect.
+
+## 4a. Checkpoint B — the procedure of record (`<checkpoint_b>`)
+
+<checkpoint_b>
+**CHECKPOINT B — MANDATORY POST-RUN COMPLIANCE GATE.** Runs after execution and after ALL
+debugging, before `AUTOMATION COMPLETE`. Work the §2 checklist again. **Order: drafts → freeze →
+validations → gate → publish** (`<publication>` in `final-run.md`): the run file, the report, the bug file and
+the draft page are written as DRAFTS under `{results_root}/artifacts/drafts/phase-{N}/`, the results-freshness
+check (step 4) is recorded in the draft run file's `impact.final_check`, and only then is the scope frozen — all of it
+done by ONE command, `run-data.mjs finalize` (`<publication>` in `final-run.md`), which calls `check.mjs checkpoint
+--checkpoint B` after drafting. Nothing is edited from the freeze to the gate — a re-hash that differs voids the
+checkpoint, and the second `finalize` call refuses rather than re-drafting. A valid, applicable PASS of Checkpoint A must
+cover every final file at its current content (refresh A on files changed by a heal first).
+
+1. **Repeat the FULL review on the FINAL code — including every file that passed Checkpoint A.**
+   Debugging changes code; A's results describe the code as it was then, not as it is now.
+   **Both halves again, not just the fast one:**
+   - *mechanical* and *runtime* — run by `finalize` (type check, validator, config inventory, run protections, lint;
+     then `run-data.mjs verify` on this phase's own evidence: 16b, 18, 22, 23, 25b, 31-34, 37, 38, 43, 45, 46b, 48a, 48b,
+     50 — always, even when no source file changed); a FAIL there stops before the review with the items named;
+   - *semantic* — re-review every `S` item of `references/compliance-checkpoints.md` §2 against
+     the final code: layer ownership, whether each assertion still verifies its required outcome,
+     evidence placement, and each honoured exception's substance. A clean re-scan is not a
+     repeated review. Fill `semantic-B.template.json` (as at A) and pass it to `finalize --review`.
+   `check.mjs carry --from {snapshotId A} --to {snapshotId B}` may run beside it: SHADOW ONLY — it changes
+   nothing about this full review.
+2. **Confirm debugging introduced no shortcuts:** no weakened assertion, no broken POM boundary,
+   no removed or relocated evidence, no suppressed error, no new unjustified skip or raised
+   timeout, no changed application setting, no product-code edit — and **no page class written
+   during debugging outside the inventory**: the re-run validator (with `--inventory`) reports no
+   open `pom-duplicate-page`, and every class it lists under `pageScan` has its
+   `automation-inventory.md` row — and **no scratch probe left behind or cited** (item 50).
+3. **Verify the artifacts were ACTUALLY produced** — this is the half Checkpoint A could not do (check 18 and
+   the evidence manifest are decided by `run-data.mjs verify`; the rest is your semantic review of the DRAFTS):
+   - every executed attempt has its assertion-point image at the path the draft run file records, and
+     every failed attempt its failure image;
+   - each image is associated with the right TC-ID and variant, and the **evidence sanity check**
+     passes (no PASS image showing a cleaned-up screen);
+   - the draft run file (status final), the `## Phase {N}` section of the draft report, the draft bug file
+     (one entry per `app_bug` of this phase, no bug marked resolved without a passing retest), the draft
+     page and the progress log exist, are internally consistent and **correspond to the final tested
+     code** — compare the `scopeDigest` recorded for the run against the current one;
+   - the renderer's payload for the draft page (`--base {results_root}`) says `gate: PASS`, and
+     `warnings[]` carries no `evidence-file-missing` / `bug-report-missing` / `run-file-missing`; the
+     published page is rendered later, by `run-data.mjs publish`, from these exact drafts;
+   - the story folder's top level holds nothing outside the whitelist (legacy files untouched);
+   - expected failures (`fail`), extended timeouts (`slow`) and skips appear as themselves in the
+     report, never folded into the pass count;
+   - Requirement → TC → automated test → execution result is mappable end to end, and the three
+     coverage figures are reported separately (`<coverage_measurement>`).
+4. **Results-freshness check — every reported result ran on the code it reports.** `finalize` runs `impact.mjs
+   select` on the final code and writes the outcome to the draft run file's `impact.final_check` BEFORE the freeze (the
+   gate reads it there): `stale: []` for every TC reported with a result — a stale TC stops `finalize` (re-run it, or report
+   it `NOT_RUN` with `not started: code changed after its run`); every `fresh_by_member_only[]` TC needs your semantic
+   review (the changed member is truly unreachable from it — `file:line`, else re-run it), given as `--member-reviews
+   {json}` `{"TC-…": "file:line — why"}`; without it `finalize` stops at `AWAITING_REVIEW` (step `member-review`) before
+   the freeze. This per-TC proof replaces "any result older than the last code change"; an applicable check that did not
+   run is `unresolved`, never PASS.
+5. **The gate, then publication — `finalize --review {semantic-B.json}`.** On the frozen drafts only: the validated batch,
+   the gate (`.runs/phase-{N}.checkpoint-B.json` with the frozen draft hashes), and only on `PASS` the publication of
+   exactly those drafts (`<publication>`). `FAIL` / `BLOCKED` → nothing is published; repair, re-draft, and freeze again
+   (`finalize` without `--review`).
+
+**If an automation defect is found here:** repair it immediately → re-run the relevant static
+checks → **rerun the affected tests**, selected by `impact.mjs select` (its closure includes every
+consumer of a changed shared component — page object, fixture, helper, config — and every
+`unknown[]` test is always selected) → if the selection cannot bound the blast radius, run the
+full in-scope suite → then **repeat the full Checkpoint B review** on the result.
+
+**Any later code change invalidates the checks and results it affects** — which results: per TC,
+by `impact.mjs`. Refresh Checkpoint A's applicable checks before rerunning and repeat B afterwards.
+A recorded gate is valid only for the `scopeDigest` it names — **never claim completion from stale
+results.**
+
+**Do not rerun to make a failure disappear.** An unchanged application defect or an environment
+failure is not fixed by repetition: preserve the evidence, classify it (`app_bug`,
+`environment_failure`, `unverified_assumption`), and report it as an unresolved blocker. The
+automatic isolation check is the one exception, and it is a classification step, not a retry: a
+FAIL beside other tests becomes a verdict only once the TC ran alone, `retries` stays `0`, and the
+parallel attempt stays in the history and the report.
+
+**Gate result.** `PASS` only when there are no confirmed violations in the final delivered scope
+**and** every `review[]` / `notRun[]` item is closed — by the scanner, by other project tooling,
+or by documented semantic review against the same `scopeDigest` — **and** the results-freshness
+check found no stale TC with a reported result — **and** `check.mjs gate --checkpoint B` accepted every result
+(none missing, stale, contradictory or duplicate; the re-hash matched). Otherwise `FAIL` or `BLOCKED`,
+named item by item. Record it per `compliance-checkpoints.md` §5.
+
+**Both gates must PASS for the final delivered scope before claiming automation compliance**, and
+compliance status is reported separately from execution status: compliant tests can expose
+application defects, passing tests can still violate these rules, and an environment blocker can
+leave a gate BLOCKED with nothing wrong in the code.
+</checkpoint_b>
+
+---
+
+## 5. Recording a gate
+
+**The record of a gate is its gate-record file** — `.runs/phase-{N}.checkpoint-{A|B}.json`, written by
+`check.mjs gate` (§1). The return's gate line (open items one per line), the report's `- **Compliance:**` Run bullet,
+`{run_file}.compliance` and the progress log carry what that file says — never a verdict of your own. Each human-readable record carries:
+
+```
+Checkpoint {A|B} — {PASS | FAIL | BLOCKED}
+Scope:        {N tests, M page objects/fixtures/helpers, list or glob}
+Code state:   scopeDigest {sha} · {N} files hashed · git {HEAD short} {clean|+K uncommitted} (context only)
+Checks:       {validator gate + counts} · {project tooling run} · {semantic items reviewed}
+Findings:     {ruleId} {file}:{line} — {one line}
+Repairs:      {what changed} → {re-check run} → {result}
+Open items:   {review/notRun item} — {verified-semantic: reasoning | unresolved: why}
+Unresolved:   {check} — {why it could not be verified}   ← each one keeps this gate BLOCKED
+N/A:          {check} — {why this rule has NO SUBJECT in this scope}
+```
+
+Rules for the record:
+
+- **An applicable check that did not run is never PASS and never `N/A`.** It is `unresolved`, and
+  the gate is **BLOCKED** until it is verified. `N/A` is reserved for a rule that has no subject in
+  this scope, with the reason naming why it has none (§1).
+- **Distinguish "scheduled for Checkpoint B" from "completed now."** At A, runtime artifacts are
+  scheduled; saying they exist is a false claim.
+- `git` state is context only. The identity of the tested code is the `scopeDigest`: content hashes
+  of the in-scope code and configuration, **including untracked files**, excluding generated output
+  (`reports/`, `screenshots/`, `automation-logs/`, `coverage/`) so a report cannot invalidate its own
+  run.
+- Compliance status and execution status are reported separately. A BLOCKED gate with a green suite
+  is a real and reportable outcome, and so is a PASS gate with failing tests that found real bugs.

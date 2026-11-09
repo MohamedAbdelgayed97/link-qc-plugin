@@ -1,0 +1,26 @@
+{
+  "upstream": "AhmedZaher1233/Link_AI_Pro",
+  "upstreamSha": "d5b8012",
+  "hash": "4de0f9a696374c689c548c140bfb0802479ced5314decf9a599b6cfd60d043a1",
+  "version": "1.3.0",
+  "skills": [
+    "ado-bug-report",
+    "link-qc-1-generate-update-testing-structure",
+    "link-qc-10-white-box-testing",
+    "link-qc-11-discover-business-rules",
+    "link-qc-12-adhd-output-style",
+    "link-qc-13-test-run-manual-cli",
+    "link-qc-14-visualplanner",
+    "link-qc-2-review-requirements",
+    "link-qc-3-generate-manual-test-cases",
+    "link-qc-3c-validate-manual-test-cases-cli",
+    "link-qc-4-publish-test-cases-azure",
+    "link-qc-5-test-run-automation",
+    "link-qc-5c-test-run-automation-lite",
+    "link-qc-6-ui-testing",
+    "link-qc-7-sync-tc-status-to-azure",
+    "link-qc-8-sync-bugs-azure",
+    "link-qc-9-retesting",
+    "skill-quality-review"
+  ]
+}
